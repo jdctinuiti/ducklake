@@ -160,7 +160,7 @@ public:
 	static PhysicalOperator &PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
 	                                    DuckLakeTableEntry &table, PhysicalOperator &child_plan,
 	                                    vector<idx_t> row_id_indexes, string encryption_key,
-	                                    bool allow_duplicates = true);
+	                                    bool allow_duplicates = true, bool metadata_delete_allowed = false);
 
 public:
 	// Sink interface
