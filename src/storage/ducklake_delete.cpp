@@ -831,6 +831,37 @@ bool ScanHasOnlyPartitionFilters(DuckLakeTableEntry &table, PhysicalTableScan &s
 	return true;
 }
 
+bool HasActiveDeleteFilesForDataFiles(DuckLakeTransaction &transaction, TableIndex table_id,
+                                      const vector<DuckLakeFileListExtendedEntry> &files) {
+	string file_ids;
+	for (auto &file : files) {
+		if (!file.file_id.IsValid()) {
+			continue;
+		}
+		if (!file_ids.empty()) {
+			file_ids += ",";
+		}
+		file_ids += to_string(file.file_id.index);
+	}
+	if (file_ids.empty()) {
+		return false;
+	}
+	auto result = transaction.Query(transaction.GetSnapshot(), StringUtil::Format(R"(
+SELECT COUNT(*)
+FROM {METADATA_CATALOG}.ducklake_delete_file
+WHERE table_id=%d AND data_file_id IN (%s)
+  AND {SNAPSHOT_ID} >= begin_snapshot AND ({SNAPSHOT_ID} < end_snapshot OR end_snapshot IS NULL)
+)",
+	                                                                              table_id.index, file_ids));
+	if (result->HasError()) {
+		result->GetErrorObject().Throw("Failed to check active DuckLake delete files: ");
+	}
+	for (auto &row : *result) {
+		return row.GetValue<idx_t>(0) > 0;
+	}
+	return false;
+}
+
 bool CanUseMetadataDelete(ClientContext &context, DuckLakeTableEntry &table, PhysicalOperator &child_plan,
                           vector<DuckLakeFileListExtendedEntry> &files) {
 	auto scan = FindMetadataDeleteSource(child_plan);
@@ -869,6 +900,9 @@ bool CanUseMetadataDelete(ClientContext &context, DuckLakeTableEntry &table, Phy
 			return false;
 		}
 		data_files.push_back(std::move(file));
+	}
+	if (HasActiveDeleteFilesForDataFiles(transaction, table.GetTableId(), data_files)) {
+		return false;
 	}
 	files = std::move(data_files);
 	return true;
