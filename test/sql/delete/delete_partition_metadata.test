@@ -77,6 +77,11 @@ SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE end_snapshot IS NOT NULL;
 1
 
 # Existing row-level deletes make the visible row count differ from raw file rows, so this falls back.
+query II
+EXPLAIN DELETE FROM partitioned_t;
+----
+physical_plan	<!REGEX>:.*DUCKLAKE_METADATA_DELETE.*
+
 query I
 DELETE FROM partitioned_t;
 ----
@@ -86,11 +91,6 @@ query I
 SELECT COUNT(*) FROM partitioned_t;
 ----
 0
-
-query I
-SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE table_id = (SELECT table_id FROM metadata.ducklake_table WHERE table_name = 'partitioned_t') AND end_snapshot IS NOT NULL;
-----
-1
 
 # Full-table DELETE on a partitioned table with no existing deletes is metadata-only.
 statement ok
@@ -132,6 +132,11 @@ INSERT INTO null_partitioned_t VALUES (1, NULL), (2, 'present');
 statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
+query II
+EXPLAIN DELETE FROM null_partitioned_t WHERE source IS NULL;
+----
+physical_plan	<!REGEX>:.*DUCKLAKE_METADATA_DELETE.*
+
 query I
 DELETE FROM null_partitioned_t WHERE source IS NULL;
 ----
@@ -141,11 +146,6 @@ query II
 SELECT id, source FROM null_partitioned_t ORDER BY id;
 ----
 2	present
-
-query I
-SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE table_id = (SELECT table_id FROM metadata.ducklake_table WHERE table_name = 'null_partitioned_t') AND end_snapshot IS NOT NULL;
-----
-0
 
 statement ok
 CREATE TABLE constant_false_t (id INT, source VARCHAR);
@@ -186,6 +186,11 @@ INSERT INTO transformed_t VALUES (1, TIMESTAMP '2024-01-15 00:00:00', 10), (2, T
 statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
+query II
+EXPLAIN DELETE FROM transformed_t WHERE ts = TIMESTAMP '2024-01-15 00:00:00';
+----
+physical_plan	<!REGEX>:.*DUCKLAKE_METADATA_DELETE.*
+
 query I
 DELETE FROM transformed_t WHERE ts = TIMESTAMP '2024-01-15 00:00:00';
 ----
@@ -213,6 +218,11 @@ INSERT INTO mixed_or_t VALUES (1, 'x', 10), (2, 'x', 20), (5, 'y', 50), (6, 'y',
 statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
+query II
+EXPLAIN DELETE FROM mixed_or_t WHERE source = 'x' OR id = 5;
+----
+physical_plan	<!REGEX>:.*DUCKLAKE_METADATA_DELETE.*
+
 query I
 DELETE FROM mixed_or_t WHERE source = 'x' OR id = 5;
 ----
@@ -222,8 +232,3 @@ query III
 SELECT id, source, value FROM mixed_or_t ORDER BY id;
 ----
 6	y	60
-
-query I
-SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE table_id = (SELECT table_id FROM metadata.ducklake_table WHERE table_name = 'mixed_or_t') AND end_snapshot IS NOT NULL;
-----
-0
