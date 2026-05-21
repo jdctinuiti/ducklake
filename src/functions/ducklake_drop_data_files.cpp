@@ -59,7 +59,7 @@ static unique_ptr<FunctionData> DuckLakeDropDataFilesBind(ClientContext &context
 		if (lower == "dry_run") {
 			result->dry_run = BooleanValue::Get(entry.second);
 		} else if (lower != "schema" && lower != "partition_values") {
-			throw InternalException("Unknown named parameter %s for drop_data_files", entry.first);
+			throw InvalidInputException("Unknown named parameter %s for drop_data_files", entry.first);
 		}
 	}
 

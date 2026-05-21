@@ -22,6 +22,8 @@ class DuckLakePartitionFilter {
 public:
 	static DuckLakePartitionFilter Parse(DuckLakeTableEntry &table, const Value &filter);
 
+	//! Matches files written with the current partition spec. Transaction-local files may not have
+	//! a stable partition_id yet, so the id check is only enforced when the file has a partition_id.
 	bool Matches(optional_idx file_partition_id, const vector<DuckLakeFilePartition> &file_values) const;
 
 private:
