@@ -228,6 +228,39 @@ SELECT id, year(ts) FROM partial_spec_t ORDER BY id;
 3	2025
 
 statement ok
+CREATE TABLE evolved_partition_t (id INT, source VARCHAR, region VARCHAR);
+
+statement ok
+ALTER TABLE evolved_partition_t SET PARTITIONED BY (source);
+
+statement ok
+INSERT INTO evolved_partition_t VALUES (1, 'a', 'old'), (2, 'b', 'old');
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+statement ok
+ALTER TABLE evolved_partition_t SET PARTITIONED BY (region, source);
+
+statement ok
+INSERT INTO evolved_partition_t VALUES (3, 'a', 'new'), (4, 'b', 'new');
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+SELECT COUNT(*), SUM(row_count) FROM ducklake_drop_data_files('ducklake', 'evolved_partition_t', partition_values => struct_pack(source := 'a'));
+----
+1	1
+
+query III
+SELECT id, source, region FROM evolved_partition_t ORDER BY id;
+----
+1	a	old
+2	b	old
+4	b	new
+
+statement ok
 CREATE TABLE duplicate_transform_t (id INT, created_at TIMESTAMP, updated_at TIMESTAMP);
 
 statement ok
