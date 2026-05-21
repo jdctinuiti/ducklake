@@ -49,8 +49,11 @@ SELECT source, COUNT(*) FROM partitioned_t GROUP BY source ORDER BY source NULLS
 NULL	1
 b	1
 
+statement ok
+SET VARIABLE partitioned_t_table_id = (SELECT table_id FROM metadata.ducklake_table WHERE table_name = 'partitioned_t');
+
 query I
-SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE table_id = (SELECT table_id FROM metadata.ducklake_table WHERE table_name = 'partitioned_t') AND end_snapshot IS NOT NULL;
+SELECT COUNT(*) FROM metadata.ducklake_data_file WHERE table_id = getvariable('partitioned_t_table_id') AND end_snapshot IS NOT NULL;
 ----
 1
 
@@ -172,30 +175,32 @@ SELECT id, source FROM existing_delete_t ORDER BY id;
 3	b
 
 statement ok
-CREATE TABLE mixed_inlined_t (id INT, source VARCHAR);
+CREATE TABLE repeated_partition_t (id INT, source VARCHAR);
 
 statement ok
-ALTER TABLE mixed_inlined_t SET PARTITIONED BY (source);
+ALTER TABLE repeated_partition_t SET PARTITIONED BY (source);
 
 statement ok
-INSERT INTO mixed_inlined_t VALUES (1, 'a'), (2, 'b');
+INSERT INTO repeated_partition_t VALUES (1, 'a'), (2, 'b');
 
 statement ok
 CALL ducklake_flush_inlined_data('ducklake')
 
 statement ok
-INSERT INTO mixed_inlined_t VALUES (3, 'a');
+INSERT INTO repeated_partition_t VALUES (3, 'a');
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
 
 query II
-SELECT COUNT(*), SUM(row_count) FROM ducklake_drop_data_files('ducklake', 'mixed_inlined_t', partition_values => struct_pack(source := 'a'));
+SELECT COUNT(*), SUM(row_count) FROM ducklake_drop_data_files('ducklake', 'repeated_partition_t', partition_values => struct_pack(source := 'a'));
 ----
-1	1
+2	2
 
 query II
-SELECT id, source FROM mixed_inlined_t ORDER BY id;
+SELECT id, source FROM repeated_partition_t ORDER BY id;
 ----
 2	b
-3	a
 
 statement ok
 CREATE TABLE partial_spec_t (id INT, ts TIMESTAMP);
