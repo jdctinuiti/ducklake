@@ -749,20 +749,19 @@ bool IsIdentityPartitionField(DuckLakeTableEntry &table, idx_t field_index) {
 }
 
 bool ExpressionReferencesOnlyIdentityPartitionFields(DuckLakeTableEntry &table, const Expression &expr,
-                                                    TableIndex table_index) {
+                                                     TableIndex table_index) {
 	bool result = true;
-	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(
-	    expr, [&](const BoundColumnRefExpression &col_ref) {
-		    if (col_ref.binding.table_index != table_index) {
-			    result = false;
-			    return;
-		    }
-		    auto &column = table.GetColumn(LogicalIndex(col_ref.binding.column_index));
-		    auto &field_id = table.GetFieldId(column.Physical());
-		    if (!IsIdentityPartitionField(table, field_id.GetFieldIndex().index)) {
-			    result = false;
-		    }
-	    });
+	ExpressionIterator::VisitExpression<BoundColumnRefExpression>(expr, [&](const BoundColumnRefExpression &col_ref) {
+		if (col_ref.binding.table_index != table_index) {
+			result = false;
+			return;
+		}
+		auto &column = table.GetColumn(LogicalIndex(col_ref.binding.column_index));
+		auto &field_id = table.GetFieldId(column.Physical());
+		if (!IsIdentityPartitionField(table, field_id.GetFieldIndex().index)) {
+			result = false;
+		}
+	});
 	return result;
 }
 
@@ -910,10 +909,11 @@ bool CanUseMetadataDelete(ClientContext &context, DuckLakeTableEntry &table, Phy
 
 PhysicalOperator &DuckLakeDelete::PlanDelete(ClientContext &context, PhysicalPlanGenerator &planner,
                                              DuckLakeTableEntry &table, PhysicalOperator &child_plan,
-                                             vector<idx_t> row_id_indexes, string encryption_key,
-                                             bool allow_duplicates, bool metadata_delete_allowed) {
+                                             vector<idx_t> row_id_indexes, string encryption_key, bool allow_duplicates,
+                                             bool metadata_delete_allowed) {
 	vector<DuckLakeFileListExtendedEntry> metadata_delete_files;
-	if (allow_duplicates && metadata_delete_allowed && CanUseMetadataDelete(context, table, child_plan, metadata_delete_files)) {
+	if (allow_duplicates && metadata_delete_allowed &&
+	    CanUseMetadataDelete(context, table, child_plan, metadata_delete_files)) {
 		return planner.Make<DuckLakeMetadataDelete>(table, std::move(metadata_delete_files));
 	}
 
