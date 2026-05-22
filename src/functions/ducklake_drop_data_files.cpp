@@ -107,7 +107,7 @@ WHERE data.table_id=%d
   AND data.data_file_id IN (%s)
 ORDER BY data.data_file_id, part.partition_key_index
 )",
-	                               table.GetTableId().index, StringUtil::Join(file_ids, ", "));
+	                                table.GetTableId().index, StringUtil::Join(file_ids, ", "));
 	auto rows = transaction.Query(query);
 	if (rows->HasError()) {
 		rows->GetErrorObject().Throw("Failed to get DuckLake partition values: ");

@@ -73,7 +73,8 @@ DuckLakePartitionFilter DuckLakePartitionFilter::Parse(DuckLakeTableEntry &table
 		auto partition_key_name = StructType::GetChildName(filter.type(), child_idx);
 		auto partition_key = partition_keys.find(StringUtil::Lower(partition_key_name));
 		if (partition_key == partition_keys.end()) {
-			throw InvalidInputException("Unknown partition key \"%s\" for table \"%s\"", partition_key_name, table.name);
+			throw InvalidInputException("Unknown partition key \"%s\" for table \"%s\"", partition_key_name,
+			                            table.name);
 		}
 		parsed_values[partition_key->second.partition_key_index] =
 		    CastPartitionValue(children[child_idx], partition_key->second.type, partition_key_name);
