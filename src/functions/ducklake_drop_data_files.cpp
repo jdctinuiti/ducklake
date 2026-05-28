@@ -75,12 +75,22 @@ static unique_ptr<GlobalTableFunctionState> DuckLakeDropDataFilesInit(ClientCont
 	return make_uniq<DuckLakeDropDataFilesState>();
 }
 
-static unordered_map<idx_t, DropDataFile> GetDropDataFiles(DuckLakeTransaction &transaction,
-                                                           DuckLakeTableEntry &table) {
+static vector<DuckLakeFilePartition> ConvertPartitionValues(const vector<DuckLakeFilePartitionInfo> &partition_values) {
+	vector<DuckLakeFilePartition> result;
+	for (auto &partition : partition_values) {
+		DuckLakeFilePartition converted;
+		converted.partition_column_idx = partition.partition_column_idx;
+		converted.partition_value = partition.partition_value;
+		result.push_back(std::move(converted));
+	}
+	return result;
+}
+
+static vector<DuckLakeFileListExtendedEntry> GetDropDataFiles(DuckLakeTransaction &transaction,
+                                                              DuckLakeTableEntry &table) {
 	auto &metadata_manager = transaction.GetMetadataManager();
-	auto active_files = metadata_manager.GetFilesForTable(table, transaction.GetSnapshot(), nullptr);
-	unordered_map<idx_t, DropDataFile> result;
-	vector<string> file_ids;
+	auto active_files = metadata_manager.GetExtendedFilesForTable(table, transaction.GetSnapshot(), nullptr);
+	vector<DuckLakeFileListExtendedEntry> result;
 	for (auto &file : active_files) {
 		if (file.data_type != DuckLakeDataType::DATA_FILE || !file.file_id.IsValid()) {
 			continue;
@@ -88,46 +98,7 @@ static unordered_map<idx_t, DropDataFile> GetDropDataFiles(DuckLakeTransaction &
 		if (transaction.FileIsDropped(file.file.path)) {
 			continue;
 		}
-		DropDataFile drop_file;
-		drop_file.file_id = file.file_id;
-		drop_file.path = file.file.path;
-		result[file.file_id.index] = std::move(drop_file);
-		file_ids.push_back(std::to_string(file.file_id.index));
-	}
-	if (result.empty()) {
-		return result;
-	}
-
-	auto query = StringUtil::Format(R"(
-SELECT data.data_file_id, data.record_count, data.partition_id, part.partition_key_index, part.partition_value
-FROM {METADATA_CATALOG}.ducklake_data_file data
-LEFT JOIN {METADATA_CATALOG}.ducklake_file_partition_value part
-  ON data.data_file_id = part.data_file_id AND data.table_id = part.table_id
-WHERE data.table_id=%d
-  AND data.data_file_id IN (%s)
-ORDER BY data.data_file_id, part.partition_key_index
-)",
-	                                table.GetTableId().index, StringUtil::Join(file_ids, ", "));
-	auto rows = transaction.Query(query);
-	if (rows->HasError()) {
-		rows->GetErrorObject().Throw("Failed to get DuckLake partition values: ");
-	}
-	for (auto &row : *rows) {
-		auto data_file_id = row.GetValue<idx_t>(0);
-		auto file_entry = result.find(data_file_id);
-		if (file_entry == result.end()) {
-			continue;
-		}
-		auto &file = file_entry->second;
-		file.row_count = row.GetValue<idx_t>(1);
-		file.partition_id = row.IsNull(2) ? optional_idx() : row.GetValue<idx_t>(2);
-		if (row.IsNull(3)) {
-			continue;
-		}
-		DuckLakeFilePartition partition_value;
-		partition_value.partition_column_idx = row.GetValue<idx_t>(3);
-		partition_value.partition_value = row.IsNull(4) ? Value(LogicalType::VARCHAR) : Value(row.GetValue<string>(4));
-		file.partition_values.push_back(std::move(partition_value));
+		result.push_back(std::move(file));
 	}
 	return result;
 }
@@ -153,15 +124,15 @@ static void DuckLakeDropDataFilesExecute(ClientContext &context, TableFunctionIn
 		auto &bind_data = data_p.bind_data->Cast<DuckLakeDropDataFilesData>();
 		auto &transaction = DuckLakeTransaction::Get(context, bind_data.catalog);
 		auto files = GetDropDataFiles(transaction, bind_data.table);
-		for (auto &entry : files) {
-			auto &file = entry.second;
-			if (!bind_data.partition_filter.Matches(file.partition_id, file.partition_values)) {
+		for (auto &file : files) {
+			auto partition_values = ConvertPartitionValues(file.partition_values);
+			if (!bind_data.partition_filter.Matches(file.partition_id, partition_values)) {
 				continue;
 			}
 			if (!bind_data.dry_run) {
-				transaction.DropFile(bind_data.table.GetTableId(), file.file_id, file.path);
+				transaction.DropFile(bind_data.table.GetTableId(), file.file_id, file.file.path);
 			}
-			state.rows.push_back({Value(file.path), Value::UBIGINT(file.row_count)});
+			state.rows.push_back({Value(file.file.path), Value::UBIGINT(file.row_count)});
 		}
 		auto transaction_local_files = GetTransactionLocalDropDataFiles(transaction, bind_data.table.GetTableId());
 		for (auto &file : transaction_local_files) {
