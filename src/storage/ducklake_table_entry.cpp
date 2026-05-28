@@ -13,7 +13,6 @@
 #include "duckdb/parser/tableref/table_function_ref.hpp"
 #include "duckdb/parser/parsed_data/create_table_info.hpp"
 #include "duckdb/parser/parser.hpp"
-#include "duckdb/parser/expression/cast_expression.hpp"
 #include "duckdb/parser/expression/columnref_expression.hpp"
 #include "duckdb/parser/expression/function_expression.hpp"
 #include "duckdb/parser/parsed_expression_iterator.hpp"
@@ -108,16 +107,33 @@ DuckLakeTableEntry::DuckLakeTableEntry(DuckLakeTableEntry &parent, CreateTableIn
 	                                           local_change.is_column_new);
 }
 
-static void ReplaceColumnRefName(ParsedExpression &expr, const string &old_name, const string &new_name) {
-	if (expr.GetExpressionType() == ExpressionType::COLUMN_REF) {
-		auto &colref = expr.Cast<ColumnRefExpression>();
+static void ReplaceColumnRefName(unique_ptr<ParsedExpression> &expr, const string &old_name, const string &new_name) {
+	if (expr->GetExpressionType() == ExpressionType::COLUMN_REF) {
+		auto &colref = expr->Cast<ColumnRefExpression>();
 		if (!colref.IsQualified() && StringUtil::CIEquals(colref.GetColumnName(), old_name)) {
-			colref.column_names.back() = new_name;
+			expr = make_uniq<ColumnRefExpression>(new_name);
 		}
 		return;
 	}
 	ParsedExpressionIterator::EnumerateChildren(
-	    expr, [&](ParsedExpression &child) { ReplaceColumnRefName(child, old_name, new_name); });
+	    *expr, [&](unique_ptr<ParsedExpression> &child) { ReplaceColumnRefName(child, old_name, new_name); });
+}
+
+static bool HasColumnRefChild(const ParsedExpression &expr) {
+	bool has_column_ref_child = false;
+	ParsedExpressionIterator::EnumerateChildren(expr, [&](const ParsedExpression &child) {
+		if (child.GetExpressionType() == ExpressionType::COLUMN_REF) {
+			has_column_ref_child = true;
+		}
+	});
+	return has_column_ref_child;
+}
+
+bool IsSimpleCast(const ParsedExpression &expr) {
+	if (expr.GetExpressionType() != ExpressionType::OPERATOR_CAST) {
+		return false;
+	}
+	return HasColumnRefChild(expr);
 }
 
 // ALTER TABLE RENAME COLUMN
@@ -134,7 +150,7 @@ DuckLakeTableEntry::DuckLakeTableEntry(DuckLakeTableEntry &parent, CreateTableIn
 		for (auto &sort_field : sort_data->fields) {
 			auto parsed = Parser::ParseExpressionList(sort_field.expression);
 			if (!parsed.empty()) {
-				ReplaceColumnRefName(*parsed[0], old_col_name, new_name);
+				ReplaceColumnRefName(parsed[0], old_col_name, new_name);
 				sort_field.expression = parsed[0]->ToString();
 			}
 		}
@@ -863,17 +879,6 @@ bool TypePromotionIsAllowed(const LogicalType &source, const LogicalType &target
 	default:
 		return false;
 	}
-}
-
-bool IsSimpleCast(const ParsedExpression &expr) {
-	if (expr.GetExpressionType() != ExpressionType::OPERATOR_CAST) {
-		return false;
-	}
-	auto &cast = expr.Cast<CastExpression>();
-	if (cast.child->GetExpressionType() != ExpressionType::COLUMN_REF) {
-		return false;
-	}
-	return true;
 }
 
 idx_t GetNestedChildCount(const LogicalType &type) {
