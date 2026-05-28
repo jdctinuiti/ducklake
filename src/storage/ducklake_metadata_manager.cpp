@@ -20,6 +20,7 @@
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/common/sql_identifier.hpp"
 #include "duckdb/parser/expression/cast_expression.hpp"
+#include "duckdb/parser/parsed_expression_iterator.hpp"
 #include "duckdb/planner/filter/expression_filter.hpp"
 #include "duckdb/planner/filter/table_filter_functions.hpp"
 #include "duckdb/planner/expression/bound_comparison_expression.hpp"
@@ -2124,8 +2125,11 @@ string DuckLakeMetadataManager::WriteNewSchemas(const vector<DuckLakeSchemaInfo>
 string GetExpressionType(ParsedExpression &expression) {
 	switch (expression.GetExpressionType()) {
 	case ExpressionType::OPERATOR_CAST: {
-		auto &cast_expression = expression.Cast<CastExpression>();
-		if (cast_expression.child->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
+		bool casts_constant = false;
+		ParsedExpressionIterator::EnumerateChildren(expression, [&](const ParsedExpression &child) {
+			casts_constant = child.GetExpressionType() == ExpressionType::VALUE_CONSTANT;
+		});
+		if (casts_constant) {
 			return "literal";
 		}
 		return "expression";
