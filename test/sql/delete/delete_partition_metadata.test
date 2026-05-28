@@ -115,6 +115,34 @@ SELECT id, source, value FROM same_column_and_t ORDER BY id;
 4	c	40
 
 statement ok
+CREATE TABLE same_column_in_intersect_t (id INT, source VARCHAR, value INT);
+
+statement ok
+ALTER TABLE same_column_in_intersect_t SET PARTITIONED BY (source);
+
+statement ok
+INSERT INTO same_column_in_intersect_t VALUES (1, 'a', 10), (2, 'b', 20), (3, 'b', 30), (4, 'c', 40);
+
+statement ok
+CALL ducklake_flush_inlined_data('ducklake')
+
+query II
+EXPLAIN DELETE FROM same_column_in_intersect_t WHERE source IN ('a', 'b') AND source IN ('b', 'c');
+----
+physical_plan	<REGEX>:.*DUCKLAKE_METADATA_DELETE.*
+
+query I
+DELETE FROM same_column_in_intersect_t WHERE source IN ('a', 'b') AND source IN ('b', 'c');
+----
+2
+
+query III
+SELECT id, source, value FROM same_column_in_intersect_t ORDER BY id;
+----
+1	a	10
+4	c	40
+
+statement ok
 CREATE TABLE legacy_partitioned_t (id INT, source VARCHAR, value INT);
 
 statement ok
