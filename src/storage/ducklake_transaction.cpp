@@ -2003,6 +2003,69 @@ string DuckLakeTransaction::UpdateGlobalTableStats(TableIndex table_id,
 	return metadata_manager->UpdateGlobalTableStats(stats);
 }
 
+static idx_t SaturatingSubtract(idx_t value, idx_t decrement) {
+	return decrement > value ? 0 : value - decrement;
+}
+
+void DuckLakeTransaction::ApplyDroppedFileStats(TableIndex table_id, DuckLakeNewGlobalStats &new_stats,
+                                                map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats) {
+	auto entry = attempt_dropped_file_stats.find(table_id);
+	if (entry == attempt_dropped_file_stats.end()) {
+		return;
+	}
+	auto &stats = new_stats.stats;
+	stats.record_count = SaturatingSubtract(stats.record_count, entry->second.row_count);
+	stats.table_size_bytes = SaturatingSubtract(stats.table_size_bytes, entry->second.file_size_bytes);
+	attempt_dropped_file_stats.erase(entry);
+}
+
+string DuckLakeTransaction::UpdateStatsForDroppedFiles(
+    optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+    map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats) {
+	if (attempt_dropped_file_stats.empty()) {
+		return string();
+	}
+
+	string result;
+	unique_ptr<DuckLakeStats> dl_stats;
+	if (stats) {
+		auto &schema = ducklake_catalog.GetSchemaForSnapshot(*this, GetSnapshot());
+		dl_stats = ducklake_catalog.ConstructStatsMap(*stats, schema);
+	}
+
+	vector<TableIndex> table_ids;
+	for (auto &entry : attempt_dropped_file_stats) {
+		table_ids.push_back(entry.first);
+	}
+	for (auto &table_id : table_ids) {
+		if (attempt_dropped_file_stats.find(table_id) == attempt_dropped_file_stats.end()) {
+			continue;
+		}
+
+		optional_ptr<DuckLakeTableStats> current_stats;
+		shared_ptr<DuckLakeTableStats> current_stats_pin;
+		if (dl_stats) {
+			auto dl_stats_entry = dl_stats->table_stats.find(table_id);
+			if (dl_stats_entry != dl_stats->table_stats.end()) {
+				current_stats = dl_stats_entry->second.get();
+			}
+		} else {
+			current_stats_pin = ducklake_catalog.GetTableStats(*this, table_id);
+			current_stats = current_stats_pin.get();
+		}
+		if (!current_stats) {
+			continue;
+		}
+
+		DuckLakeNewGlobalStats new_globals;
+		new_globals.stats = *current_stats;
+		new_globals.initialized = true;
+		ApplyDroppedFileStats(table_id, new_globals, attempt_dropped_file_stats);
+		result += UpdateGlobalTableStats(table_id, new_globals);
+	}
+	return result;
+}
+
 DuckLakeColumnStatsInfo DuckLakeColumnStatsInfo::FromColumnStats(FieldIndex field_id,
                                                                  const DuckLakeColumnStats &stats) {
 	DuckLakeColumnStatsInfo column_stats;
@@ -2071,7 +2134,8 @@ struct NewDataInfo {
 };
 
 NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCommitState &commit_state,
-                                                 optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats) {
+                                                 optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+                                                 map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats) {
 	NewDataInfo result;
 	// get the global table stats
 	DuckLakeNewGlobalStats new_globals;
@@ -2108,6 +2172,7 @@ NewDataInfo DuckLakeTransaction::GetNewDataFiles(string &batch_query, DuckLakeCo
 			new_globals.stats = *current_stats;
 			new_globals.initialized = true;
 		}
+		ApplyDroppedFileStats(table_id, new_globals, attempt_dropped_file_stats);
 		auto &new_stats = new_globals.stats;
 		vector<DuckLakeDeleteFile> delete_files;
 		for (auto &file : table_changes.new_data_files) {
@@ -2310,7 +2375,8 @@ struct CompactionInformation {
 
 string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
                                           TransactionChangeInformation &transaction_changes,
-                                          optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats) {
+                                          optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+                                          map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats) {
 	auto &commit_snapshot = commit_state.commit_snapshot;
 
 	if (ducklake_catalog.IsCommitInfoRequired() && !commit_info.is_commit_info_set) {
@@ -2386,7 +2452,7 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 	// write new data / data files
 	bool has_table_data_changes = local_changes.HasChanges();
 	if (has_table_data_changes) {
-		auto result = GetNewDataFiles(batch_queries, commit_state, stats);
+		auto result = GetNewDataFiles(batch_queries, commit_state, stats, attempt_dropped_file_stats);
 		batch_queries += metadata_manager->WriteNewDataFiles(commit_snapshot, result.new_files, new_tables_result,
 		                                                     new_schemas_result);
 		batch_queries += metadata_manager->WriteNewInlinedData(commit_snapshot, result.new_inlined_data,
@@ -2405,6 +2471,7 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 			dropped_indexes.insert(entry.second);
 		}
 		batch_queries += metadata_manager->DropDataFiles(dropped_indexes);
+		batch_queries += UpdateStatsForDroppedFiles(stats, attempt_dropped_file_stats);
 	}
 
 	if (has_table_data_changes) {
@@ -2589,6 +2656,7 @@ void DuckLakeTransaction::FlushChanges() {
 	optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats;
 	for (idx_t i = 0; i < max_retry_count + 1; i++) {
 		bool can_retry;
+		auto attempt_dropped_file_stats = dropped_file_stats;
 		try {
 			can_retry = false;
 			if (i > 0) {
@@ -2608,7 +2676,7 @@ void DuckLakeTransaction::FlushChanges() {
 			DuckLakeCommitState commit_state(commit_snapshot);
 			// write the new snapshot
 			string batch_queries = metadata_manager->InsertSnapshot();
-			batch_queries += CommitChanges(commit_state, transaction_changes, stats);
+			batch_queries += CommitChanges(commit_state, transaction_changes, stats, attempt_dropped_file_stats);
 
 			batch_queries += WriteSnapshotChanges(commit_state, transaction_changes);
 			auto res = metadata_manager->Execute(commit_snapshot, batch_queries);
@@ -2616,6 +2684,9 @@ void DuckLakeTransaction::FlushChanges() {
 				res->GetErrorObject().Throw("Failed to flush changes into DuckLake: ");
 			}
 			connection->Commit();
+			if (!dropped_file_stats.empty()) {
+				ducklake_catalog.InvalidateStatsCache(commit_snapshot.next_file_id);
+			}
 			catalog_version = commit_snapshot.schema_version;
 
 			// finished writing
@@ -2994,9 +3065,13 @@ void DuckLakeTransaction::DropTableMacro(DuckLakeTableMacroEntry &macro) {
 	dropped_table_macros.insert(macro.GetIndex());
 }
 
-void DuckLakeTransaction::DropFile(TableIndex table_id, DataFileIndex data_file_id, string path) {
+void DuckLakeTransaction::DropFile(TableIndex table_id, DataFileIndex data_file_id, string path, idx_t row_count,
+                                   idx_t file_size_bytes) {
 	tables_deleted_from.insert(table_id);
 	dropped_files.emplace(std::move(path), data_file_id);
+	auto &stats = dropped_file_stats[table_id];
+	stats.row_count += row_count;
+	stats.file_size_bytes += file_size_bytes;
 }
 
 bool DuckLakeTransaction::HasDroppedFiles() const {

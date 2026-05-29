@@ -250,6 +250,8 @@ public:
 	InlinedDeletionCacheResult CheckInlinedDeletionTableCache(TableIndex table_id, DuckLakeSnapshot snapshot);
 	//! Cache the result of an inlined deletion table existence check
 	void CacheInlinedDeletionTableResult(TableIndex table_id, DuckLakeSnapshot snapshot, bool exists);
+	//! Invalidate the cached stats entry for a given next_file_id.
+	void InvalidateStatsCache(idx_t next_file_id);
 
 private:
 	void DropSchema(ClientContext &context, DropInfo &info) override;
