@@ -51,6 +51,13 @@ struct DroppedDataFileStats {
 	idx_t file_size_bytes = 0;
 };
 
+struct CompactionStatsChange {
+	idx_t removed_record_count = 0;
+	idx_t removed_file_size_bytes = 0;
+	idx_t added_record_count = 0;
+	idx_t added_file_size_bytes = 0;
+};
+
 struct LocalTableDataChanges {
 	vector<DuckLakeDataFile> new_data_files;
 	unique_ptr<DuckLakeInlinedData> new_inlined_data;
@@ -329,6 +336,9 @@ private:
 	                           map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
 	string UpdateStatsForDroppedFiles(optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
 	                                  map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
+	void ApplyCompactionStats(DuckLakeNewGlobalStats &new_stats, const CompactionStatsChange &stats_change);
+	string UpdateStatsForCompactions(optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+	                                 const map<TableIndex, CompactionStatsChange> &stats_changes);
 	SnapshotAndStats CheckForConflicts(DuckLakeSnapshot transaction_snapshot,
 	                                   const TransactionChangeInformation &changes);
 	void CheckForConflicts(const TransactionChangeInformation &changes, const SnapshotChangeInformation &other_changes,

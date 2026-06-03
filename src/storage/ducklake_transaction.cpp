@@ -2066,6 +2066,55 @@ string DuckLakeTransaction::UpdateStatsForDroppedFiles(
 	return result;
 }
 
+void DuckLakeTransaction::ApplyCompactionStats(DuckLakeNewGlobalStats &new_stats,
+                                               const CompactionStatsChange &stats_change) {
+	auto &stats = new_stats.stats;
+	stats.record_count = SaturatingSubtract(stats.record_count, stats_change.removed_record_count);
+	stats.record_count += stats_change.added_record_count;
+	stats.table_size_bytes = SaturatingSubtract(stats.table_size_bytes, stats_change.removed_file_size_bytes);
+	stats.table_size_bytes += stats_change.added_file_size_bytes;
+}
+
+string DuckLakeTransaction::UpdateStatsForCompactions(
+    optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
+    const map<TableIndex, CompactionStatsChange> &stats_changes) {
+	if (stats_changes.empty()) {
+		return string();
+	}
+
+	string result;
+	unique_ptr<DuckLakeStats> dl_stats;
+	if (stats) {
+		auto &schema = ducklake_catalog.GetSchemaForSnapshot(*this, GetSnapshot());
+		dl_stats = ducklake_catalog.ConstructStatsMap(*stats, schema);
+	}
+
+	for (const auto &entry : stats_changes) {
+		const auto table_id = entry.first;
+		optional_ptr<DuckLakeTableStats> current_stats;
+		shared_ptr<DuckLakeTableStats> current_stats_pin;
+		if (dl_stats) {
+			auto dl_stats_entry = dl_stats->table_stats.find(table_id);
+			if (dl_stats_entry != dl_stats->table_stats.end()) {
+				current_stats = dl_stats_entry->second.get();
+			}
+		} else {
+			current_stats_pin = ducklake_catalog.GetTableStats(*this, table_id);
+			current_stats = current_stats_pin.get();
+		}
+		if (!current_stats) {
+			continue;
+		}
+
+		DuckLakeNewGlobalStats new_globals;
+		new_globals.stats = *current_stats;
+		new_globals.initialized = true;
+		ApplyCompactionStats(new_globals, entry.second);
+		result += UpdateGlobalTableStats(table_id, new_globals);
+	}
+	return result;
+}
+
 DuckLakeColumnStatsInfo DuckLakeColumnStatsInfo::FromColumnStats(FieldIndex field_id,
                                                                  const DuckLakeColumnStats &stats) {
 	DuckLakeColumnStatsInfo column_stats;
@@ -2371,7 +2420,19 @@ DuckLakeTransaction::GetNewInlinedDeletes(DuckLakeCommitState &commit_state) con
 struct CompactionInformation {
 	vector<DuckLakeCompactedFileInfo> compacted_files;
 	vector<DuckLakeFileInfo> new_files;
+	map<TableIndex, CompactionStatsChange> stats_changes;
 };
+
+static void MergeCompactionStatsChanges(map<TableIndex, CompactionStatsChange> &target,
+                                        const map<TableIndex, CompactionStatsChange> &source) {
+	for (const auto &entry : source) {
+		auto &target_stats = target[entry.first];
+		target_stats.removed_record_count += entry.second.removed_record_count;
+		target_stats.removed_file_size_bytes += entry.second.removed_file_size_bytes;
+		target_stats.added_record_count += entry.second.added_record_count;
+		target_stats.added_file_size_bytes += entry.second.added_file_size_bytes;
+	}
+}
 
 string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
                                           TransactionChangeInformation &transaction_changes,
@@ -2502,6 +2563,11 @@ string DuckLakeTransaction::CommitChanges(DuckLakeCommitState &commit_state,
 		    commit_snapshot, compaction_rewrite_delete_changes.new_files, new_tables_result, new_schemas_result);
 		batch_queries += metadata_manager->WriteCompactions(compaction_rewrite_delete_changes.compacted_files,
 		                                                    CompactionType::REWRITE_DELETES);
+
+		map<TableIndex, CompactionStatsChange> compaction_stats_changes;
+		MergeCompactionStatsChanges(compaction_stats_changes, compaction_merge_adjacent_changes.stats_changes);
+		MergeCompactionStatsChanges(compaction_stats_changes, compaction_rewrite_delete_changes.stats_changes);
+		batch_queries += UpdateStatsForCompactions(stats, compaction_stats_changes);
 	}
 
 	// Tracking for tables that had schema changes
@@ -2574,6 +2640,10 @@ CompactionInformation DuckLakeTransaction::GetCompactionChanges(DuckLakeCommitSt
 
 			idx_t row_id_limit = 0;
 			for (auto &compacted_file : compaction.source_files) {
+				auto &stats_change = result.stats_changes[table_id];
+				stats_change.removed_record_count += compacted_file.file.row_count;
+				stats_change.removed_file_size_bytes += compacted_file.file.data.file_size_bytes;
+
 				row_id_limit += compacted_file.file.row_count;
 				if (!compacted_file.delete_files.empty()) {
 					row_id_limit -= compacted_file.delete_files.back().row_count;
@@ -2605,6 +2675,9 @@ CompactionInformation DuckLakeTransaction::GetCompactionChanges(DuckLakeCommitSt
 				    "Compaction error - rewrite compaction without output file must fully delete source files");
 			}
 			if (has_new_file) {
+				auto &stats_change = result.stats_changes[table_id];
+				stats_change.added_record_count += new_file.row_count;
+				stats_change.added_file_size_bytes += new_file.file_size_bytes;
 				result.new_files.push_back(std::move(new_file));
 			}
 		}
