@@ -1620,7 +1620,14 @@ string DuckLakeMetadataManager::GenerateFilterFromExpression(const Expression &e
 			if (!result.empty()) {
 				result += conjunction_type == ExpressionType::CONJUNCTION_OR ? " OR " : " AND ";
 			}
-			result += "(" + child_str + ")";
+			// AND and OR are associative, so a same-type child can be spliced in rather than nested.
+			// DuckDB hands these to us as left-deep chains, and the parser recurses over the parens.
+			if (child->GetExpressionClass() == ExpressionClass::BOUND_CONJUNCTION &&
+			    child->GetExpressionType() == conjunction_type) {
+				result += child_str;
+			} else {
+				result += "(" + child_str + ")";
+			}
 		}
 		return result;
 	}
@@ -1654,53 +1661,114 @@ string DuckLakeMetadataManager::GenerateFilterPushdown(const ExpressionFilter &f
 	return GenerateFilterFromExpression(*filter.expr, nullptr, referenced_stats, stats_alias);
 }
 
+//! Register the stats a column CTE must project - a tree may reference the same column from several
+//! leaves, each asking for its own stats
+static void AddCTERequirement(map<idx_t, CTERequirement> &requirements, idx_t column_field_index,
+                              const unordered_set<string> &referenced_stats) {
+	auto entry = requirements.find(column_field_index);
+	if (entry == requirements.end()) {
+		requirements.emplace(column_field_index, CTERequirement(column_field_index, referenced_stats));
+		return;
+	}
+	entry->second.referenced_stats.insert(referenced_stats.begin(), referenced_stats.end());
+}
+
+string DuckLakeMetadataManager::GenerateColumnFilterCondition(const ColumnFilterInfo &column_filter,
+                                                              FilterSQLResult &result) {
+	auto cte_name = StatsCteName(column_filter.column_field_index);
+
+	unordered_set<string> referenced_stats;
+	auto filter_condition = GenerateFilterPushdown(*column_filter.table_filter, referenced_stats, cte_name);
+
+	if (filter_condition.empty()) {
+		return string();
+	}
+
+	string null_checks;
+	for (const auto &stat : referenced_stats) {
+		null_checks += StatsColumn(cte_name, stat) + " IS NULL OR ";
+	}
+
+	// a filter that a NULL row can satisfy must not prune files that only hold NULLs, even though their
+	// min/max are absent - only a purely value-based filter may use the guard
+	const bool matches_null_rows = referenced_stats.count("null_count") > 0;
+	const bool needs_value_count_guard =
+	    !matches_null_rows && (referenced_stats.count("min_value") > 0 || referenced_stats.count("max_value") > 0);
+	if (needs_value_count_guard) {
+		referenced_stats.insert("value_count");
+	}
+
+	string condition;
+	// Files that have no stats entry for this column (i.e., written before the column was added) join to
+	// NULL and must NOT be pruned, we cannot determine filter satisfaction without stats.
+	if (needs_value_count_guard) {
+		auto value_count = StatsColumn(cte_name, "value_count");
+		condition =
+		    StringUtil::Format("(%s.data_file_id IS NULL OR ((%s IS NULL OR %s > 0) AND (%s(%s))))", cte_name.c_str(),
+		                       value_count.c_str(), value_count.c_str(), null_checks.c_str(), filter_condition.c_str());
+	} else {
+		condition = StringUtil::Format("(%s.data_file_id IS NULL OR (%s(%s)))", cte_name.c_str(), null_checks.c_str(),
+		                               filter_condition.c_str());
+	}
+
+	AddCTERequirement(result.required_ctes, column_filter.column_field_index, referenced_stats);
+	return condition;
+}
+
+string DuckLakeMetadataManager::GenerateFilterTreeCondition(const DuckLakeFilterNode &node, FilterSQLResult &result,
+                                                            bool splice_into_parent) {
+	if (node.type == DuckLakeFilterNodeType::MATCH_NONE) {
+		return "1=0";
+	}
+	if (node.type == DuckLakeFilterNodeType::COLUMN_FILTER) {
+		return GenerateColumnFilterCondition(*node.column_filter, result);
+	}
+	const bool is_or = node.type == DuckLakeFilterNodeType::CONJUNCTION_OR;
+	string condition;
+	for (const auto &child : node.children) {
+		auto child_condition = GenerateFilterTreeCondition(*child, result, child->type == node.type);
+		if (child_condition.empty()) {
+			// a branch we cannot express prunes nothing, so the whole disjunction prunes nothing
+			if (is_or) {
+				return string();
+			}
+			continue;
+		}
+		if (!condition.empty()) {
+			condition += is_or ? " OR " : " AND ";
+		}
+		condition += child_condition;
+	}
+	if (condition.empty()) {
+		return string();
+	}
+	return splice_into_parent ? condition : "(" + condition + ")";
+}
+
 FilterSQLResult DuckLakeMetadataManager::ConvertFilterPushdownToSQL(const FilterPushdownInfo &filter_info) {
 	FilterSQLResult result;
 	string conditions;
 
 	for (const auto &entry : filter_info.column_filters) {
-		const auto &column_filter = entry.second;
-
-		auto cte_name = StatsCteName(column_filter.column_field_index);
-
-		unordered_set<string> referenced_stats;
-		auto filter_condition = GenerateFilterPushdown(*column_filter.table_filter, referenced_stats, cte_name);
-
-		if (filter_condition.empty()) {
+		auto condition = GenerateColumnFilterCondition(entry.second, result);
+		if (condition.empty()) {
 			continue;
 		}
-
-		string null_checks;
-		for (const auto &stat : referenced_stats) {
-			null_checks += StatsColumn(cte_name, stat) + " IS NULL OR ";
-		}
-
-		// a filter that a NULL row can satisfy must not prune files that only hold NULLs, even though their
-		// min/max are absent - only a purely value-based filter may use the guard
-		const bool matches_null_rows = referenced_stats.count("null_count") > 0;
-		const bool needs_value_count_guard =
-		    !matches_null_rows && (referenced_stats.count("min_value") > 0 || referenced_stats.count("max_value") > 0);
-		if (needs_value_count_guard) {
-			referenced_stats.insert("value_count");
-		}
-
 		if (!conditions.empty()) {
 			conditions += "\n  AND ";
 		}
-		// Files that have no stats entry for this column (i.e., written before the column was added) join to
-		// NULL and must NOT be pruned, we cannot determine filter satisfaction without stats.
-		if (needs_value_count_guard) {
-			auto value_count = StatsColumn(cte_name, "value_count");
-			conditions += StringUtil::Format("(%s.data_file_id IS NULL OR ((%s IS NULL OR %s > 0) AND (%s(%s))))",
-			                                 cte_name.c_str(), value_count.c_str(), value_count.c_str(),
-			                                 null_checks.c_str(), filter_condition.c_str());
-		} else {
-			conditions += StringUtil::Format("(%s.data_file_id IS NULL OR (%s(%s)))", cte_name.c_str(),
-			                                 null_checks.c_str(), filter_condition.c_str());
-		}
+		conditions += condition;
+	}
 
-		result.required_ctes.emplace(column_filter.column_field_index,
-		                             CTERequirement(column_filter.column_field_index, referenced_stats));
+	for (const auto &tree : filter_info.filter_trees) {
+		auto condition = GenerateFilterTreeCondition(*tree.root, result);
+		if (condition.empty()) {
+			continue;
+		}
+		if (!conditions.empty()) {
+			conditions += " AND ";
+		}
+		conditions += condition;
 	}
 
 	result.where_conditions = conditions;
@@ -1946,7 +2014,7 @@ string DuckLakeMetadataManager::GenerateFileListQuery(DuckLakeTableEntry &table,
 		};
 	}
 	FilterSQLResult filter_result;
-	if (filter_info && !filter_info->column_filters.empty()) {
+	if (filter_info && !filter_info->Empty()) {
 		filter_result = ConvertFilterPushdownToSQL(*filter_info);
 		if (table.GetPartitionData()) {
 			auto partition_value_table = metadata_table_prefix + ".ducklake_file_partition_value";
@@ -3223,6 +3291,29 @@ string DuckLakeMetadataManager::WriteNewInlinedData(DuckLakeSnapshot &commit_sna
 	return batch_query;
 }
 
+//! Parsing a statement takes memory proportional to its length, so large VALUES lists are split over statements
+static constexpr idx_t MAX_VALUES_LIST_LENGTH = 65536;
+
+static string ChunkValuesStatements(const vector<string> &tuples,
+                                    const std::function<string(const string &values)> &make_statement) {
+	string result;
+	string values;
+	for (auto &tuple : tuples) {
+		if (!values.empty()) {
+			values += ", ";
+		}
+		values += tuple;
+		if (values.size() >= MAX_VALUES_LIST_LENGTH) {
+			result += make_statement(values);
+			values.clear();
+		}
+	}
+	if (!values.empty()) {
+		result += make_statement(values);
+	}
+	return result;
+}
+
 string DuckLakeMetadataManager::FormatInlinedDataInsert(const string &inlined_table_name, idx_t row_id_start,
                                                         bool has_preserved_row_ids, const vector<int64_t> *row_ids,
                                                         const vector<string> &cells_per_row) {
@@ -3230,7 +3321,8 @@ string DuckLakeMetadataManager::FormatInlinedDataInsert(const string &inlined_ta
 		return string();
 	}
 	idx_t row_id = row_id_start;
-	string values;
+	vector<string> tuples;
+	tuples.reserve(cells_per_row.size());
 	for (idx_t i = 0; i < cells_per_row.size(); i++) {
 		int64_t emit_rid;
 		if (has_preserved_row_ids) {
@@ -3240,13 +3332,11 @@ string DuckLakeMetadataManager::FormatInlinedDataInsert(const string &inlined_ta
 		} else {
 			emit_rid = static_cast<int64_t>(row_id++);
 		}
-		if (!values.empty()) {
-			values += ", ";
-		}
-		values += StringUtil::Format("(%lld, {SNAPSHOT_ID}, NULL, %s)", emit_rid, cells_per_row[i]);
+		tuples.push_back(StringUtil::Format("(%lld, {SNAPSHOT_ID}, NULL, %s)", emit_rid, cells_per_row[i]));
 	}
-	return StringUtil::Format("INSERT INTO {METADATA_CATALOG}.%s VALUES %s;", SQLIdentifier(inlined_table_name),
-	                          values);
+	auto insert_prefix =
+	    StringUtil::Format("INSERT INTO {METADATA_CATALOG}.%s VALUES ", SQLIdentifier(inlined_table_name));
+	return ChunkValuesStatements(tuples, [&](const string &values) { return insert_prefix + values + ";"; });
 }
 
 string DuckLakeMetadataManager::WriteNewInlinedDeletes(const vector<DuckLakeDeletedInlinedDataInfo> &new_deletes,
@@ -3257,15 +3347,14 @@ string DuckLakeMetadataManager::WriteNewInlinedDeletes(const vector<DuckLakeDele
 	}
 	for (auto &entry : new_deletes) {
 		// get a list of all deleted row-ids for this table
-		string row_id_list;
+		vector<string> row_ids;
+		row_ids.reserve(entry.deleted_row_ids.size());
 		for (auto &deleted_id : entry.deleted_row_ids) {
-			if (!row_id_list.empty()) {
-				row_id_list += ", ";
-			}
-			row_id_list += StringUtil::Format("(%d)", deleted_id);
+			row_ids.push_back(StringUtil::Format("(%d)", deleted_id));
 		}
 		// overwrite the snapshot for the old tags
-		batch_queries += StringUtil::Format(R"(
+		batch_queries += ChunkValuesStatements(row_ids, [&](const string &row_id_list) {
+			return StringUtil::Format(R"(
 WITH deleted_row_list(deleted_row_id) AS (
 VALUES %s
 )
@@ -3274,8 +3363,9 @@ SET %s = {SNAPSHOT_ID}
 FROM deleted_row_list
 WHERE %s=deleted_row_id AND %s IS NULL AND %s != {SNAPSHOT_ID};
 )",
-		                                    row_id_list, entry.table_name, col_names.end_snapshot, col_names.row_id,
-		                                    col_names.end_snapshot, col_names.begin_snapshot);
+			                          row_id_list, entry.table_name, col_names.end_snapshot, col_names.row_id,
+			                          col_names.end_snapshot, col_names.begin_snapshot);
+		});
 	}
 	return batch_queries;
 }
@@ -3301,17 +3391,16 @@ DuckLakeMetadataManager::WriteNewInlinedFileDeletesSql(const vector<DuckLakeInli
 			                                    table_name);
 			created_new_table = true;
 		}
-		string values;
+		vector<string> tuples;
 		for (auto &file_entry : entry.file_deletions.file_deletes) {
 			auto file_id = file_entry.first;
 			for (auto &row_id : file_entry.second) {
-				if (!values.empty()) {
-					values += ", ";
-				}
-				values += StringUtil::Format("(%d, %d, {SNAPSHOT_ID})", file_id, row_id);
+				tuples.push_back(StringUtil::Format("(%d, %d, {SNAPSHOT_ID})", file_id, row_id));
 			}
 		}
-		batch_queries += StringUtil::Format("INSERT INTO {METADATA_CATALOG}.%s VALUES %s;\n", table_name, values);
+		batch_queries += ChunkValuesStatements(tuples, [&](const string &values) {
+			return StringUtil::Format("INSERT INTO {METADATA_CATALOG}.%s VALUES %s;\n", table_name, values);
+		});
 	}
 	return batch_queries;
 }
@@ -4686,6 +4775,11 @@ FROM {METADATA_CATALOG}.ducklake_snapshot
 WHERE snapshot_id = %llu;)",
 		                                  val.DefaultCastAs(LogicalType::UBIGINT).GetValue<idx_t>()));
 	} else if (unit == "timestamp") {
+		auto timestamp = val.CastAs(*transaction.GetConnection().context, LogicalType::TIMESTAMP_TZ);
+		auto current_time = timestamp_tz_t(Timestamp::GetCurrentTimestamp());
+		if (!timestamp.IsNull() && timestamp.GetValue<timestamp_tz_t>() > current_time) {
+			throw InvalidInputException("Cannot time travel to a future timestamp: %s", val.ToString());
+		}
 		result = Query(StringUtil::Format(
 		    R"(
 SELECT snapshot_id, schema_version, next_catalog_id, next_file_id
@@ -4696,7 +4790,7 @@ WHERE snapshot_id = (
 	WHERE snapshot_time::TIMESTAMPTZ %s= %s
 	ORDER BY snapshot_time::TIMESTAMPTZ %s
 	LIMIT 1);)",
-		    timestamp_condition, val.DefaultCastAs(LogicalType::VARCHAR).ToSQLString(), timestamp_order));
+		    timestamp_condition, timestamp.DefaultCastAs(LogicalType::VARCHAR).ToSQLString(), timestamp_order));
 	} else {
 		throw InvalidInputException("Unsupported AT clause unit - %s", unit);
 	}

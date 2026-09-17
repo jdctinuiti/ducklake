@@ -16,6 +16,7 @@
 #include "storage/ducklake_partition_data.hpp"
 #include "storage/ducklake_sort_data.hpp"
 #include "common/index.hpp"
+#include "duckdb/common/unordered_set.hpp"
 #include "storage/ducklake_field_data.hpp"
 #include "common/local_change.hpp"
 #include "storage/ducklake_metadata_manager.hpp"
@@ -34,6 +35,9 @@ struct ColumnChangeInfo {
 	void DropField(const DuckLakeFieldId &field_id);
 };
 
+//! Returns the first GEOMETRY or VARIANT field at or below this one, whose bounds cannot be skipped
+optional_ptr<const DuckLakeFieldId> FindStatsUnsupportedField(const DuckLakeFieldId &field_id);
+
 class DuckLakeTableEntry : public TableCatalogEntry {
 public:
 	DuckLakeTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info, TableIndex table_id,
@@ -42,6 +46,8 @@ public:
 	                   LocalChange local_change);
 
 public:
+	const ColumnList &GetColumns() const override;
+
 	TableIndex GetTableId() const {
 		return table_id;
 	}
@@ -74,6 +80,10 @@ public:
 	const DuckLakeFieldData &GetFieldData() const {
 		return *field_data;
 	}
+	//! Field indexes whose min/max bounds are not recorded, including children of a skipped field
+	unordered_set<idx_t> GetSkippedStatsFields() const;
+	//! Refuses a field added below a skipped column whose statistics cannot be skipped
+	void ValidateAddedFieldsCanSkipStats(const DuckLakeFieldId &parent_id, const DuckLakeFieldId &new_field_id) const;
 	const ColumnChangeInfo &GetChangedFields() const {
 		return *changed_fields;
 	}
@@ -188,6 +198,9 @@ public:
 	DuckLakeTableEntry(DuckLakeTableEntry &parent, CreateTableInfo &info, unique_ptr<DuckLakePartition> partition_data);
 	// ! Create a DuckLakeTableEntry from a SET SORT KEY
 	DuckLakeTableEntry(DuckLakeTableEntry &parent, CreateTableInfo &info, unique_ptr<DuckLakeSort> sort_data);
+
+protected:
+	ColumnList columns;
 
 private:
 	TableIndex table_id;

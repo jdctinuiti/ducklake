@@ -145,8 +145,9 @@ optional_ptr<CatalogEntry> DuckLakeSchemaEntry::CreateFunction(CatalogTransactio
 			DuckLakeTypes::CheckSupportedType(type, version);
 		}
 		for (auto &entry : macro->default_parameters) {
-			if (entry.second->GetExpressionType() == ExpressionType::VALUE_CONSTANT) {
-				DuckLakeTypes::CheckSupportedType(entry.second->Cast<ConstantExpression>().GetValue().type(), version);
+			Value default_value;
+			if (DuckLakeUtil::TryGetLiteralValue(*entry.second, default_value)) {
+				DuckLakeTypes::CheckSupportedType(default_value.type(), version);
 			}
 		}
 	}

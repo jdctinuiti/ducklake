@@ -1,4 +1,5 @@
 #include "storage/ducklake_transaction_state.hpp"
+#include "duckdb/common/operator/cast_operators.hpp"
 
 #include "common/ducklake_types.hpp"
 #include "common/ducklake_util.hpp"
@@ -511,9 +512,13 @@ void GetNewMacroInfo(DuckLakeCommitState &commit_state, reference<CatalogEntry> 
 			parameter.parameter_type = DuckLakeTypes::ToString(impl->types[i]);
 			auto default_it = impl->default_parameters.find(Identifier(parameter.parameter_name));
 			if (default_it != impl->default_parameters.end()) {
-				auto &const_expr = default_it->second->Cast<ConstantExpression>();
-				parameter.default_value = const_expr.GetValue().ToString();
-				parameter.default_value_type = DuckLakeTypes::ToString(const_expr.GetValue().type());
+				Value default_value;
+				if (!DuckLakeUtil::TryGetLiteralValue(*default_it->second, default_value)) {
+					throw NotImplementedException("Non-constant default value for macro parameter \"%s\"",
+					                              parameter.parameter_name);
+				}
+				parameter.default_value = default_value.ToString();
+				parameter.default_value_type = DuckLakeTypes::ToString(default_value.type());
 			} else {
 				parameter.default_value_type = "unknown";
 			}
@@ -868,6 +873,32 @@ static optional_idx GetCurrentTableSchemaVersion(TableIndex table_id, DuckLakeSn
 	return optional_idx();
 }
 
+//! The field ids of `table_id`'s skip_stats_columns option, read from the metadata rather than the catalog so
+//! the server-side commit resolves it too. Only roots matter here: step 3 of the recompute merges inlined stats,
+//! which TryMergeInlinedStats only produces for scalar roots.
+static set<FieldIndex> ReadSkippedStatsFields(TableIndex table_id, const DuckLakeCommitContext &context) {
+	set<FieldIndex> result;
+	auto query = StringUtil::Format("SELECT value FROM {METADATA_CATALOG}.ducklake_metadata "
+	                                "WHERE key='skip_stats_columns' AND scope='table' AND scope_id=%d;",
+	                                table_id.index);
+	auto stats_option = context.query_metadata(query);
+	if (stats_option->HasError()) {
+		stats_option->GetErrorObject().Throw("Failed to read the skip_stats_columns option from DuckLake: ");
+	}
+	for (auto &row : *stats_option) {
+		if (row.IsNull(0)) {
+			continue;
+		}
+		for (auto &entry : StringUtil::Split(row.GetValue<string>(0), ',')) {
+			idx_t field_index;
+			if (TryCast::Operation<string_t, idx_t>(string_t(entry), field_index)) {
+				result.insert(FieldIndex(field_index));
+			}
+		}
+	}
+	return result;
+}
+
 bool DuckLakeTransactionState::TryRecomputeGlobalStatsFromFiles(DuckLakeNewGlobalStats &new_globals,
                                                                 TableIndex table_id, DuckLakeSnapshot snapshot,
                                                                 const vector<DuckLakeFileInfo> &new_files,
@@ -1008,7 +1039,17 @@ bool DuckLakeTransactionState::TryRecomputeGlobalStatsFromFiles(DuckLakeNewGloba
 		new_stats.record_count += net_inlined;
 	}
 
-	// 4. A global column stat is safe only when every live parquet file contributed to it. Sparse per-file stats are
+	// 4. A column the table opted out of bounds for does not get them back here - no file records bounds for it,
+	//    so step 3 would hand back bounds describing the inlined rows alone.
+	for (auto &field_index : ReadSkippedStatsFields(table_id, context)) {
+		auto entry = new_stats.column_stats.find(field_index);
+		if (entry == new_stats.column_stats.end()) {
+			continue;
+		}
+		entry->second.ClearBounds();
+	}
+
+	// 5. A global column stat is safe only when every live parquet file contributed to it. Sparse per-file stats are
 	//    valid metadata (for example, files added with allow_missing), so reset only incomplete columns to unknown.
 	//    Also make sure every committed column (root or nested leaf) appears so its global row is refreshed. A column
 	//    with no live data becomes "unknown" -> it is scanned at query time, which is correct.
