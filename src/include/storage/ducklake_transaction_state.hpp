@@ -166,27 +166,17 @@ public:
 	NewMacroInfo GetNewMacros(DuckLakeCommitState &commit_state, TransactionChangeInformation &transaction_changes);
 	NewDataInfo GetNewDataFiles(string &batch_query, DuckLakeCommitState &commit_state,
 	                            optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
-	                            const DuckLakeCommitContext &context,
-	                            map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
-	//! Decrement table-level stats for files dropped this commit; returns true if live rows remain.
-	static bool ApplyDroppedFileStats(TableIndex table_id, DuckLakeNewGlobalStats &new_stats,
-	                                  map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
-	string UpdateStatsForDroppedFiles(optional_ptr<vector<DuckLakeGlobalStatsInfo>> stats,
-	                                  const DuckLakeCommitContext &context,
-	                                  map<TableIndex, DroppedDataFileStats> &attempt_dropped_file_stats);
+	                            const DuckLakeCommitContext &context);
 	CompactionInformation GetCompactionChanges(DuckLakeCommitState &commit_state, CompactionType type);
-	bool TryRecomputeGlobalStatsFromFiles(DuckLakeNewGlobalStats &new_globals, TableIndex table_id,
-	                                      DuckLakeSnapshot snapshot, const vector<DuckLakeFileInfo> &new_files,
-	                                      const set<DataFileIndex> &removed_file_ids, idx_t expected_data_file_rows,
-	                                      const DuckLakeCommitContext &context);
-	//! After a REWRITE_DELETES compaction, recompute EXACT global stats for `table_id` from the post-rewrite file set
-	//! (+ committed inlined data) and append the UpdateGlobalTableStats SQL to `batch_query`. No-op (leaving the
-	//! existing stale stats, and the scan fallback) if the table is not fully delete-free post-rewrite or the
-	//! inlined data cannot be accounted for exactly.
-	void RecomputeGlobalStatsAfterRewrite(string &batch_query, TableIndex table_id, DuckLakeSnapshot snapshot,
-	                                      const CompactionInformation &rewrite_changes,
-	                                      const set<DataFileIndex> &removed_source_ids,
-	                                      const DuckLakeCommitContext &context);
+	//! Refresh table totals after drops or compactions; leave column stats unknown unless all rows are accounted for.
+	void RefreshGlobalStatsAfterFileSetChange(string &batch_query, TableIndex table_id, DuckLakeSnapshot snapshot,
+	                                          const set<DataFileIndex> &removed_file_ids,
+	                                          const vector<DuckLakeFileInfo> &added_files,
+	                                          const vector<DuckLakeFileInfo> &row_id_advancing_files,
+	                                          const vector<DuckLakeInlinedDataInfo> &added_inlined_data,
+	                                          idx_t expected_data_file_rows, DuckLakeStats *attempt_stats,
+	                                          const DuckLakeCommitContext &context, bool recompute_column_stats,
+	                                          bool force_unknown_column_stats, idx_t deleted_inlined_rows);
 	//! Merge committed inlined data's per-column min/max into `target` via typed SQL aggregates. Returns false if the
 	//! inlined data cannot be accounted for exactly (e.g. a non-scalar column), in which case the caller must not
 	//! claim the recomputed stats are exact.
