@@ -932,8 +932,10 @@ Connection &DuckLakeTransaction::GetConnection() {
 		auto caller_context = context.lock();
 		connection = make_uniq<Connection>(caller_context ? Connection::CreateInternal(*caller_context)
 		                                                  : Connection::CreateInternal(db));
+		// Follow the transaction owner so an internal caller's finalization suppression is preserved.
+		connection->context->base_context.reset();
 		connection->context->registered_state->GetOrCreate<DuckLakeInternalConnectionState>(
-		    DuckLakeInternalConnectionState::KEY, std::move(connection->context->base_context));
+		    DuckLakeInternalConnectionState::KEY, caller_context);
 		if (caller_context) {
 			DuckLakeUtil::CopyExtensionSettings(*caller_context, *connection->context);
 		}
